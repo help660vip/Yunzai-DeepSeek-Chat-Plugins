@@ -1,253 +1,223 @@
-# 智能对话插件 (DeepSeek Chat Plugin)
+# Yunzai DeepSeek Chat
 
-一个基于 Yunzai-Bot 框架的智能对话插件，接入 DeepSeek AI 大模型，为 QQ 群聊和私聊提供自然、流畅的对话体验。
+一个用于 Yunzai 的 DeepSeek 对话插件。它可以处理 QQ 私聊与群聊消息，并提供上下文记忆、群聊公共记忆、对话归档、用量统计、黑名单、聊天记录导出和群成员互动分析。
 
-## 📖 项目简介
+本项目按 Linux 上的 Yunzai 部署方式编写安装说明。插件代码使用 ECMAScript Modules，运行数据默认保存在 Yunzai 工作目录下的 `data/aitalk/`。
 
-本插件将 DeepSeek 大语言模型集成到 Yunzai-Bot 中，使机器人具备：
-- **智能对话**：自然语言理解与回复
-- **上下文记忆**：记住对话历史，提供连贯的对话体验
-- **社交分析**：分析群成员互动关系和社交网络
-- **数据持久化**：自动保存对话记录、统计信息和归档数据
-- **敏感词过滤**：内置多重敏感词检测机制
+## 功能
 
-## 🏗️ 项目结构
+- 私聊和群聊自然语言对话
+- 用户上下文与群聊公共记忆
+- 长上下文自动归档和摘要
+- Token 用量、聊天与社交统计
+- 群和用户黑名单
+- 对话记录、群聊记录导出
+- API 请求重试、冷却与速率限制
+- 可关闭的群聊随机冒泡
 
-```
-.
-├── index.js                 # 插件入口，继承 Yunzai plugin 类
-├── config/
-│   └── config.js           # 配置管理（API 配置、系统提示词、指令规则）
-├── services/
-│   ├── api.js              # DeepSeek API 通信服务（含重试机制）
-│   ├── chat.js             # 核心对话服务（消息处理、回复逻辑）
-│   ├── social.js           # 社交关系分析服务
-│   └── storage.js          # 数据持久化服务（异步落盘）
-└── utils/
-    └── tools.js            # 工具函数（语言检测、情绪识别、CQ 码清洗等）
-```
+## 运行要求
 
-## 🚀 功能特性
+- Linux
+- Node.js 18 或更高版本
+- 已可正常运行的 Yunzai，且插件入口兼容 `lib/plugins/plugin.js`
+- DeepSeek 或兼容 OpenAI Chat Completions 接口的服务
+- `node-fetch@3`
 
-### 1. 智能对话
-- 支持群聊和私聊场景
-- 基于上下文的连贯回复
-- 情绪识别与适配回复语气
-- 多语言检测（中文、英文、日语、韩语）
-- 防风控设计：日常闲聊精简回复，长文需求自动切换详细模式
+## 安装
 
-### 2. 上下文管理
-- **滑动窗口记忆**：保留最近 500 条对话记录
-- **公共记忆池**：群聊共享最近 100 条消息
-- **自动归档**：超过阈值时自动总结并压缩历史对话
-- **重要信息提取**：从对话中提取用户特征和事实
-
-### 3. 社交分析
-- **关系图谱**：分析群成员之间的互动频率
-- **情绪统计**：记录每次互动的情绪状态
-- **话题追踪**：识别常聊话题关键词
-- **社交中心识别**：找出群内最活跃的成员
-
-### 4. 数据管理
-- **异步持久化**：内存缓存 + 延迟写入，避免阻塞主线程
-- **自动备份**：每日自动备份数据，保留 7 天历史记录
-- **导出功能**：支持导出个人对话记录和群聊天记录
-
-### 5. 安全机制
-- **敏感词过滤**：政治、色情、暴力、违法、歧视等五大类敏感词检测
-- **黑名单系统**：支持拉黑群和用户
-- **冷却时间**：防止频繁请求（默认 3 秒）
-- **速率限制**：每分钟最多 10 次请求
-
-## ⚙️ 配置说明
-
-### 环境变量配置
-
-在 Yunzai 根目录创建 `.env` 文件或直接在系统中设置：
+以下命令都在 Linux 终端执行。将 `/path/to/Yunzai` 换成你的 Yunzai 实际目录。
 
 ```bash
-# DeepSeek API 密钥（必填）
-DEEPSEEK_API_KEY=your_api_key_here
-
-# 可选：自定义 API 端点
-DEEPSEEK_BASE_URL=https://api.siliconflow.com/v1
+cd /path/to/Yunzai
+git clone https://github.com/help660vip/Yunzai-DeepSeek-Chat-Plugins.git \
+  plugins/Yunzai-DeepSeek-Chat-Plugins
 ```
 
-### 配置文件 (`config/config.js`)
+在 Yunzai 根目录安装依赖。使用项目当前采用的包管理器，不要混用 lockfile。
+
+```bash
+# pnpm
+pnpm add node-fetch@3
+
+# 或 npm
+npm install node-fetch@3
+```
+
+配置环境变量后重启 Yunzai：
+
+```bash
+export DEEPSEEK_API_KEY='替换为你的 API Key'
+export API_BASE_URL='https://api.deepseek.com'
+export API_MODEL_NAME='deepseek-v4-flash'
+```
+
+插件读取以下环境变量：
+
+| 变量 | 是否必需 | 说明 |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | 是 | 首选 API Key |
+| `SILICONFLOW_API_KEY` | 否 | 未设置 `DEEPSEEK_API_KEY` 时使用 |
+| `API_BASE_URL` | 否 | API 根地址，默认 `https://api.deepseek.com` |
+| `API_MODEL_NAME` | 否 | 模型名称，默认 `deepseek-v4-flash` |
+
+插件本身不会读取任意位置的 `.env` 文件。如果你的 Yunzai 启动器不会自动载入 `.env`，请在 systemd、PM2、Docker Compose 或启动脚本中设置环境变量。
+
+PM2 用户修改环境变量后可执行：
+
+```bash
+pm2 restart yunzai --update-env
+```
+
+进程名不是 `yunzai` 时，请替换为 `pm2 list` 中显示的实际名称。
+
+## 回复触发与随机冒泡
+
+群聊中的回复分为主动触发和随机冒泡：
+
+| 场景 | 是否受 `randomBubbleChance` 控制 |
+| --- | --- |
+| 私聊消息 | 否，正常触发 |
+| 群聊中 @ 机器人 | 否，正常触发 |
+| 群聊中回复机器人消息 | 否，正常触发 |
+| 普通群消息的随机冒泡 | 是 |
+
+在 `config/config.js` 中设置：
 
 ```javascript
-export const API_CONFIG = {
-  apiKey: process.env.DEEPSEEK_API_KEY,  // 从环境变量读取
-  baseUrl: "https://api.siliconflow.com/v1",
-  modelName: "deepseek-ai/DeepSeek-V4-Flash",
-  maxRetry: 3,              // 最大重试次数
-  baseRetryDelay: 1000,     // 基础重试延迟 (ms)
-  maxTokens: 700,           // 最大输出 token 数
-  timeoutMs: 60000          // 请求超时 (ms)
-}
-
 export const LIMITS = {
-  maxContext: 500,          // 最大上下文条数
-  maxPublicMemory: 100,     // 最大公共记忆条数
-  archiveThreshold: 400,    // 触发归档的阈值
-  cooldownMs: 3000,         // 回复冷却时间 (ms)
-  rateLimitPerMinute: 10,   // 每分钟请求限制
-  maxReplyChars: 150,       // 最大回复字符数
-  randomBubbleChance: 0.01  // 随机冒泡概率 (1%)
+  // 其他配置……
+  randomBubbleChance: 0
 }
 ```
 
-## 📋 指令列表
+`randomBubbleChance` 的取值范围是 `0` 到 `1`：
 
-### 主人指令（需要管理员权限）
+- `0`：完全关闭普通群消息的随机冒泡
+- `0.01`：每条普通群消息有 1% 概率触发
+- `1`：每条普通群消息都触发
+
+修改配置后必须重启 Yunzai。设置为 `0` 只关闭随机冒泡，不会禁用私聊、@机器人或回复机器人消息。
+
+## 常用配置
+
+主要运行参数位于 `config/config.js` 的 `LIMITS`：
+
+| 配置项 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `maxContext` | 500 | 单个用户对话上下文最大条数 |
+| `maxPublicMemory` | 100 | 群公共记忆最大条数 |
+| `archiveThreshold` | 400 | 自动归档阈值 |
+| `cooldownMs` | 3000 | 同一用户回复冷却时间，单位毫秒 |
+| `rateLimitPerMinute` | 10 | 单个用户每分钟请求上限 |
+| `randomBubbleChance` | 0 | 普通群消息随机冒泡概率 |
+
+API 的重试次数、超时、最大输出 Token 和系统提示词也在同一文件中配置。不要把 API Key 直接写入源码或提交到 Git。
+
+## 指令
+
+### 普通用户
 
 | 指令 | 说明 |
-|------|------|
-| `#删除全部上下文` | 清空所有对话记录 |
-| `#查看上下文条数` | 查看当前存储的上下文数量 |
-| `#你用了多少 token` | 查看 Token 使用统计 |
-| `#归档上下文` | 手动触发对话归档 |
-| `#对话拉黑群 [群号]` | 将指定群加入黑名单 |
-| `#对话拉黑人 [QQ 号]` | 将指定用户加入黑名单 |
-| `#对话解除拉黑群 [群号]` | 从黑名单移除群 |
-| `#对话解除拉黑人 [QQ 号]` | 从黑名单移除用户 |
-| `#对话黑名单` | 查看当前黑名单 |
-| `#对话调试模式 开启/关闭` | 开关调试模式（显示耗时等信息） |
+| --- | --- |
+| `#清空我的上下文` | 清空自己的对话上下文 |
+| `#对话统计` | 生成自己的对话统计 |
+| `#查询关系 @A @B` | 分析两名群成员的互动关系 |
+| `#群关系图` | 查看群内互动概览 |
+| `#我的社交统计` | 查看自己的群内互动统计 |
+
+### 主人权限
+
+| 指令 | 说明 |
+| --- | --- |
+| `#删除全部上下文` | 删除全部上下文、归档和重要信息 |
+| `#查看上下文条数` | 查看上下文存储统计 |
+| `#你用了多少 token` | 查看 API Token 用量 |
+| `#归档上下文` | 手动归档较长上下文 |
+| `#对话拉黑群 群号` | 将群加入黑名单 |
+| `#对话拉黑人 QQ号` | 将用户加入黑名单 |
+| `#对话解除拉黑群 群号` | 解除群黑名单 |
+| `#对话解除拉黑人 QQ号` | 解除用户黑名单 |
+| `#对话黑名单` | 查看黑名单 |
+| `#对话调试模式 开启` | 开启调试输出 |
+| `#对话调试模式 关闭` | 关闭调试输出 |
 | `#导出对话记录 @用户` | 导出指定用户的对话记录 |
-| `#导出群聊天记录` | 导出当前群的聊天记录 |
+| `#导出群聊天记录` | 导出当前群的公共记忆 |
 
-### 普通指令
+指令是否可用还取决于当前 Yunzai 适配器提供的群、引用消息和主人权限字段。
 
-| 指令 | 说明 |
-|------|------|
-| `#清空我的上下文` | 清空自己的对话记录 |
-| `#对话统计` | 查看个人对话分析报告 |
-| `#查询关系 @A @B` | 分析两个用户的关系（需@两人） |
-| `#群关系图` | 查看本群社交网络概览 |
-| `#我的社交统计` | 查看自己在群内的社交数据 |
+## 数据目录
 
-### 自然对话
-- 直接发送消息即可触发对话
-- 群聊中可通过 @机器人 或回复机器人消息触发
-- 有 1% 概率随机触发"冒泡"回复
+数据默认写入 Yunzai 进程工作目录下的 `data/aitalk/`：
 
-## 🔧 技术亮点
-
-### 1. 模块化架构
-- **职责分离**：每个服务模块专注单一功能
-- **低耦合**：通过服务类进行依赖注入
-- **易扩展**：新增功能只需添加对应服务模块
-
-### 2. 性能优化
-- **异步落盘**：使用 `setTimeout` 延迟写入，避免频繁 I/O
-- **内存缓存**：使用 Map 结构快速读写
-- **指数退避重试**：API 失败时智能重试（1s, 2s, 4s）
-
-### 3. 上下文工程
-- **动态 Prompt**：根据消息类型调整系统提示
-- **情感适配**：识别用户情绪并调整回复语气
-- **语言匹配**：自动检测并使用相同语言回复
-
-### 4. 数据安全
-- **敏感词过滤**：回复前严格检测
-- **定期备份**：每日自动备份，防止数据丢失
-- **过期清理**：7 天前备份自动删除
-
-## 📊 数据存储
-
-插件数据存储在 `./data/aitalk/` 目录下：
-
-| 文件 | 说明 |
-|------|------|
-| `context.json` | 对话上下文记录 |
+| 路径 | 内容 |
+| --- | --- |
+| `context.json` | 对话上下文 |
 | `stats.json` | Token 使用统计 |
-| `important.json` | 提取的重要用户信息 |
-| `archive.json` | 归档的对话摘要 |
-| `blacklist.json` | 黑名单列表 |
-| `relationships.json` | 社交关系数据 |
-| `meta.json` | 元数据（如上次备份时间） |
-| `backup/` | 自动备份目录（保留 7 天） |
-| `exports/` | 导出的对话记录文件 |
+| `important.json` | 提取的用户信息 |
+| `archive.json` | 对话归档摘要 |
+| `blacklist.json` | 群和用户黑名单 |
+| `relationships.json` | 群成员互动数据 |
+| `meta.json` | 备份元数据 |
+| `backup/` | 自动备份，默认保留 7 天 |
+| `exports/` | 导出的文本记录 |
 
-## 🛠️ 安装步骤
+Linux 上请确保运行 Yunzai 的用户对该目录有读写权限：
 
-1. **确保已安装 Yunzai-Bot**
-   ```bash
-   git clone --depth=1 https://github.com/LeYi02/Yunzai-Bot.git
-   cd Yunzai-Bot
-   npm install
-   ```
-
-2. **安装插件依赖**
-   ```bash
-   npm install node-fetch
-   ```
-
-3. **配置 API 密钥**
-   ```bash
-   # 方法一：设置环境变量
-   export DEEPSEEK_API_KEY=your_key_here
-   
-   # 方法二：修改 config/config.js 中的 apiKey
-   ```
-
-4. **将插件放入 Yunzai 插件目录**
-   ```bash
-   cp -r . /path/to/Yunzai-Bot/plugins/DeepSeekChat/
-   ```
-
-5. **重启 Yunzai-Bot**
-
-## 📝 使用示例
-
-### 私聊对话
-```
-用户：今天天气真好
-机器人：是啊，这种日子最适合出去走走了
+```bash
+cd /path/to/Yunzai
+mkdir -p data/aitalk
+chown -R yunzai:yunzai data/aitalk
 ```
 
-### 群聊互动
+`yunzai:yunzai` 只是示例，请替换为实际运行账户。不要直接使用 `chmod -R 777`。
+
+## 项目结构
+
+```text
+.
+├── config/config.js       # API、限制、提示词和指令路由
+├── services/api.js        # API 请求与重试
+├── services/chat.js       # 消息处理与对话流程
+├── services/social.js     # 群成员互动统计
+├── services/storage.js    # 本地数据存储、备份与导出
+├── utils/tools.js         # 消息清理、检测与触发判断
+├── index.js               # Yunzai 插件入口
+├── ds.js                  # 兼容导出入口
+└── test/                  # Node.js 回归测试
 ```
-[群聊] 张三：有人知道这道题怎么做吗？
-[群聊] @机器人 这题怎么解？
-机器人：【基于群聊上下文和题目内容给出解答】
+
+## 故障排查
+
+### 提示未配置 API Key
+
+先在 Yunzai 进程内确认环境变量可见。终端里执行过 `export`，不代表 systemd、PM2 或容器中的进程能读取到它。更新进程配置后完整重启。
+
+### 随机冒泡设为 0 后仍看到回复
+
+确认已经重启 Yunzai，并区分普通群消息与以下主动触发：私聊、@机器人、回复机器人消息。概率为 `0` 时，普通群消息不会进行随机抽样；事件只提供 `group_id` 而没有 `isGroup` 的适配器也会按群消息处理。
+
+### API 请求失败
+
+检查 `API_BASE_URL` 是否包含服务商要求的版本路径、`API_MODEL_NAME` 是否为该服务商支持的模型名，并查看 Yunzai 日志中的 HTTP 状态码。代理、DNS 和防火墙也可能导致 Linux 服务器无法连接 API。
+
+### 无法写入数据
+
+确认 Yunzai 的工作目录正确，并让运行账户拥有 `data/aitalk/` 的读写权限。容器部署时还需要为该目录挂载持久卷。
+
+## 测试
+
+本项目的回归测试只使用 Node.js 内置测试运行器：
+
+```bash
+npm test
 ```
 
-### 社交分析
-```
-用户：#查询关系 @小明 @小红
-机器人：小明 和 小红 的关系：
-两人互动 23 次，其中@对方 8 次，常聊话题包括游戏 (12 次)、作业 (5 次)
-最近一次对话讨论的是周末计划
-```
+## 隐私与安全
 
-## ⚠️ 注意事项
+对话上下文、互动数据和导出记录会保存在本机。部署者应告知群成员数据用途，限制数据目录和导出文件的访问权限，并按需要制定清理与备份策略。
 
-1. **API 费用**：使用 DeepSeek API 会产生费用，请合理控制调用频率
-2. **隐私保护**：对话记录会本地存储，请妥善保管数据文件
-3. **敏感内容**：内置敏感词过滤，但建议配合群规使用
-4. **内存占用**：大量对话会占用内存，定期使用 `#归档上下文` 清理
+API Key 只应通过环境变量或部署平台的 Secret 管理功能注入。若 Key 曾被提交、粘贴到公开日志或写入可共享文件，请立即在服务商控制台撤销并重新生成。
 
-## 🤝 贡献指南
+## 反馈与贡献
 
-欢迎提交 Issue 和 Pull Request！主要贡献方向：
-- 新功能开发
-- Bug 修复
-- 性能优化
-- 文档完善
-
-## 📄 许可证
-
-本项目遵循 MIT 许可证
-
-## 🙏 致谢
-
-- [Yunzai-Bot](https://github.com/LeYi02/Yunzai-Bot) - QQ 机器人框架
-- [DeepSeek](https://www.deepseek.com/) - AI 大模型服务
-- [SiliconFlow](https://siliconflow.cn/) - API 服务提供商
-
----
-
-**开发者**：基于原始 ds.js 重构而成  
-**重构时间**：2024  
-**版本**：2.0.0
+问题与建议请提交到 [GitHub Issues](https://github.com/help660vip/Yunzai-DeepSeek-Chat-Plugins/issues)。提交代码前请先运行 `npm test`，并避免提交 `data/`、日志、导出记录和任何凭据。

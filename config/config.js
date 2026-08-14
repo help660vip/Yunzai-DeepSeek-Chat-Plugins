@@ -32,14 +32,14 @@ export const LIMITS = {
   summaryFactsKeep: 50,     // 重要事实保留条数
   archiveKeepCount: 5,      // 归档保留数量
   maxRecentMessagesPerRelationship: 10,
-  randomBubbleChance: 0.01  // 随机冒泡概率（1%）
+  randomBubbleChance: 0     // 随机冒泡概率，0 表示关闭，取值范围 0～1
 }
 
 // API 配置 - 从环境变量读取密钥
 export const API_CONFIG = {
   apiKey: process.env.DEEPSEEK_API_KEY || process.env.SILICONFLOW_API_KEY || '',
-  baseUrl: process.env.API_BASE_URL || 'https://api.siliconflow.com/v1',
-  modelName: process.env.API_MODEL_NAME || 'deepseek-ai/DeepSeek-V4-Flash',
+  baseUrl: process.env.API_BASE_URL || 'https://api.deepseek.com',
+  modelName: process.env.API_MODEL_NAME || 'deepseek-v4-flash',
   maxRetry: 3,
   baseRetryDelay: 1000,
   maxTokens: 700,

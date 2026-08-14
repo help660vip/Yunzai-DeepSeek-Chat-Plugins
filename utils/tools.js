@@ -41,6 +41,25 @@ export function normalizeWhitespace(text = '') {
   return String(text).replace(/\s+/g, ' ').trim()
 }
 
+export function isGroupMessage(e = {}) {
+  if (e.isGroup === true) return true
+  return e.group_id !== undefined && e.group_id !== null && String(e.group_id) !== ''
+}
+
+export function shouldTriggerMessageReply(e = {}, botId, randomBubbleChance = 0, random = Math.random) {
+  if (!isGroupMessage(e)) return true
+
+  const sourceUserId = String(e.source?.user_id || e.source?.sender?.user_id || '')
+  const hasBotId = botId !== undefined && botId !== null && String(botId) !== ''
+  const repliedToBot = hasBotId && sourceUserId === String(botId)
+  if (Boolean(e.atBot) || repliedToBot) return true
+
+  const chance = Number(randomBubbleChance)
+  if (!Number.isFinite(chance) || chance <= 0) return false
+  if (chance >= 1) return true
+  return random() < chance
+}
+
 export function isMeaningless(text = '') {
   const cleaned = normalizeWhitespace(cleanCQCodes(text))
   const meaningless = new Set(['哈哈', '哈哈哈', '？', '?', '。', '.', '嗯', '啊', '哦'])

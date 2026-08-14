@@ -15,6 +15,7 @@ import {
   normalizeWhitespace,
   nowLabel,
   shouldAllowLongAnswer,
+  shouldTriggerMessageReply,
   inspectSpecialMessage,
   uniqueExportName
 } from '../utils/tools.js'
@@ -73,11 +74,8 @@ class ChatService {
   }
 
   shouldTriggerReply(e) {
-    if (!e.isGroup) return true
-    const botQQ = e.self_id || Bot.uin || e.bot?.uin
-    const sourceUserId = String(e.source?.user_id || e.source?.sender?.user_id || '')
-    const repliedToBot = Boolean(botQQ) && sourceUserId === String(botQQ)
-    return Boolean(e.atBot) || repliedToBot || Math.random() < LIMITS.randomBubbleChance
+    const botQQ = e.self_id || e.bot?.uin || globalThis.Bot?.uin
+    return shouldTriggerMessageReply(e, botQQ, LIMITS.randomBubbleChance)
   }
 
   checkCooldown(userId) {
