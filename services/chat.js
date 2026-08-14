@@ -14,7 +14,6 @@ import {
   isMeaningless,
   normalizeWhitespace,
   nowLabel,
-  shouldAllowLongAnswer,
   shouldTriggerMessageReply,
   inspectSpecialMessage,
   uniqueExportName
@@ -100,9 +99,6 @@ class ChatService {
       prompt += `\n你可以参考给定的最近群聊记录回答 但不要虚构未出现的内容`
     } else {
       prompt += `\n当前环境：与 ${userName} 私聊`
-    }
-    if (shouldAllowLongAnswer(userMsg)) {
-      prompt += '\n这次用户明显需要详细回答 允许输出完整内容'
     }
     return prompt
   }
@@ -202,8 +198,7 @@ class ChatService {
 
   async clearMyContext(e) {
     const contextId = buildContextId(e)
-    if (this.storage.getContextMap().has(contextId)) {
-      this.storage.deleteContext(contextId)
+    if (this.storage.clearConversationData(contextId, e.user_id)) {
       await e.reply('好 你的记录清掉了', true)
     } else {
       await e.reply('本来就没什么记录', true)
@@ -585,6 +580,10 @@ class ChatService {
         if (facts) messages.push({ role: 'system', content: `已知用户信息：${facts}` })
       }
 
+      messages.push({
+        role: 'system',
+        content: '历史对话只用于理解事实和指代 不要模仿历史回复的篇幅和格式 当前回答长度只由这次问题的内容决定'
+      })
       messages.push(...context)
       const reply = await this.callModel(messages)
       const cleanReply = String(reply).replace(/\[CQ:[^\]]+\]/g, ' ').trim()

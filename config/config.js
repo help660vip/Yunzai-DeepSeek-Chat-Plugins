@@ -27,8 +27,6 @@ export const LIMITS = {
   recentGroupWindow: 30,    // 群聊滑动窗口大小
   cooldownMs: 3000,         // 用户冷却时间（毫秒）
   rateLimitPerMinute: 10,   // 每分钟速率限制
-  maxReplyChars: 150,       // 普通回复最大字符数
-  maxReplyLines: 3,         // 普通回复最大行数
   summaryFactsKeep: 50,     // 重要事实保留条数
   archiveKeepCount: 5,      // 归档保留数量
   maxRecentMessagesPerRelationship: 10,
@@ -42,7 +40,7 @@ export const API_CONFIG = {
   modelName: process.env.API_MODEL_NAME || 'deepseek-v4-flash',
   maxRetry: 3,
   baseRetryDelay: 1000,
-  maxTokens: 700,
+  maxTokens: process.env.API_MAX_TOKENS ? Number(process.env.API_MAX_TOKENS) : null,
   timeoutMs: 60000
 }
 
@@ -59,8 +57,13 @@ export const SYSTEM_PROMPT = `你是群聊和私聊中的智能聊天对象
 不要总是端着 要像一个有自己性格的普通人
 
 【回答风格】
-日常闲聊简洁自然 不要为了短而生硬
-如果用户明确要求长篇创作 写代码 详细解释 分步骤方案或完整文稿 允许给出完整 高质量 长回答
+先判断对方是在随口聊天 还是在认真提问 然后让回答长度自然匹配问题
+寒暄 情绪表达 玩笑 简单事实和普通闲聊 要像真人聊天一样简短 通常一两句话说完就停
+简单聊天不要主动补充背景 原理 注意事项 建议或总结 也不要把一句话能说清的内容拆成很多点
+学科知识 技术问题 代码 原理分析 作业辅导 方案和创作属于认真提问 要根据问题复杂度完整回答 不限制篇幅
+认真提问即使没有出现"详细"两个字也要提供足够信息 简单的认真问题简洁回答 复杂问题充分展开
+用户明确要求简短或详细时 优先服从用户对篇幅的要求
+简洁要自然 不要为了短而生硬 详细也不要重复凑字数
 除非用户明确要求 否则不要主动延伸话题 不要追问
 如果引用群聊上下文 要基于提供的记录回答 不要编造
 如果不确定 就直接承认不确定

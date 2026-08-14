@@ -22,21 +22,26 @@ export class DeepSeekApiService {
 
     for (let attempt = 1; attempt <= this.config.maxRetry; attempt++) {
       try {
+        const requestBody = {
+          model: this.config.modelName,
+          messages,
+          temperature: extra.temperature ?? 0.8,
+          top_p: extra.topP ?? 0.9,
+          stream: false,
+          enable_thinking: false
+        }
+        const maxTokens = extra.maxTokens ?? this.config.maxTokens
+        if (Number.isFinite(maxTokens) && maxTokens > 0) {
+          requestBody.max_tokens = Math.floor(maxTokens)
+        }
+
         const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.config.apiKey}`
           },
-          body: JSON.stringify({
-            model: this.config.modelName,
-            messages,
-            temperature: extra.temperature ?? 0.8,
-            top_p: extra.topP ?? 0.9,
-            max_tokens: extra.maxTokens ?? this.config.maxTokens,
-            stream: false,
-            enable_thinking: false
-          }),
+          body: JSON.stringify(requestBody),
           timeout: this.config.timeoutMs
         })
 

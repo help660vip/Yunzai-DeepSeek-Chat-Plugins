@@ -137,7 +137,3 @@ export function formatRelationshipKey(userA, userB) {
 export function uniqueExportName(prefix, targetId = 'unknown') {
   return `${prefix}_${Date.now()}_${targetId}.txt`
 }
-
-export function shouldAllowLongAnswer(text = '') {
-  return /(写代码|代码|详细|展开|长篇|作文|文案|教程|报告|方案|解释|分析|完整|实现|重构|脚本|文章)/.test(text)
-}

@@ -221,6 +221,18 @@ export class StorageService {
     this.scheduleFlush('context')
   }
 
+  clearConversationData(contextId, userId) {
+    const deletedContext = this.contextMap.delete(contextId)
+    const deletedArchive = this.archives.delete(contextId)
+    const deletedImportant = this.importantInfo.delete(`user_${userId}_info`)
+
+    if (deletedContext) this.scheduleFlush('context')
+    if (deletedArchive) this.scheduleFlush('archive')
+    if (deletedImportant) this.scheduleFlush('important')
+
+    return deletedContext || deletedArchive || deletedImportant
+  }
+
   clearAllContexts() {
     this.contextMap.clear()
     this.archives.clear()
