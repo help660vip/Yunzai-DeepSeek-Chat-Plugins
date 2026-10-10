@@ -16,9 +16,9 @@ export function detectEmotion(text = '') {
 export function buildEmotionHint(emotion, lang) {
   const hints = []
   if (emotion === 'happy') hints.push('对方心情不错 可以稍微活泼一点')
-  if (emotion === 'sad') hints.push('对方似乎有些难过 请温柔安慰')
-  if (emotion === 'angry') hints.push('对方可能有点生气 请保持冷静温和')
-  if (emotion === 'excited') hints.push('对方很兴奋 可以适当表达认同')
+  if (emotion === 'sad') hints.push('对方有些难过 自然接话 不要套模板安慰或急着提建议')
+  if (emotion === 'angry') hints.push('对方有点生气 平常说话即可 不要说教或机械劝冷静')
+  if (emotion === 'excited') hints.push('对方很兴奋 可以自然接话 不必夸赞或附和')
   if (lang !== 'zh') {
     const langMap = { en: '英语', ja: '日语', ko: '韩语' }
     hints.push(`对方使用${langMap[lang] || lang} 请用相同语言回复`)
@@ -26,11 +26,9 @@ export function buildEmotionHint(emotion, lang) {
   return hints.join(' ')
 }
 
-export function cleanCQCodes(text = '') {
-  return String(text)
-    .replace(/\[CQ:[^\]]+\]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
+export function cleanCQCodes(text = '', preserveLines = false) {
+  const cleaned = String(text).replace(/\[CQ:[^\]]+\]/g, ' ')
+  return preserveLines ? cleaned.trim() : cleaned.replace(/\s+/g, ' ').trim()
 }
 
 export function stripLeadingAt(text = '') {
@@ -52,7 +50,11 @@ export function shouldTriggerMessageReply(e = {}, botId, randomBubbleChance = 0,
   const sourceUserId = String(e.source?.user_id || e.source?.sender?.user_id || '')
   const hasBotId = botId !== undefined && botId !== null && String(botId) !== ''
   const repliedToBot = hasBotId && sourceUserId === String(botId)
-  if (Boolean(e.atBot) || repliedToBot) return true
+  const mentionedBot = hasBotId && (
+    (Array.isArray(e.message) && e.message.some(item => item.type === 'at' && String(item.qq) === String(botId))) ||
+    [...String(e.msg || '').matchAll(/\[CQ:at,qq=(\d+)[^\]]*\]/g)].some(match => match[1] === String(botId))
+  )
+  if (Boolean(e.atBot) || mentionedBot || repliedToBot) return true
 
   const chance = Number(randomBubbleChance)
   if (!Number.isFinite(chance) || chance <= 0) return false
@@ -103,7 +105,7 @@ export function nowLabel() {
 }
 
 export function buildContextId(e) {
-  return e.isGroup ? `group_${e.group_id}_user_${e.user_id}` : `user_${e.user_id}`
+  return isGroupMessage(e) ? `group_${e.group_id}_user_${e.user_id}` : `user_${e.user_id}`
 }
 
 export function buildPublicMemoryId(groupId) {
@@ -136,4 +138,31 @@ export function formatRelationshipKey(userA, userB) {
 
 export function uniqueExportName(prefix, targetId = 'unknown') {
   return `${prefix}_${Date.now()}_${targetId}.txt`
+}
+
+export function contextBelongsToUser(contextId, userId) {
+  const id = String(userId)
+  return contextId === `user_${id}` || /^group_\d+_user_\d+$/.test(contextId) && contextId.endsWith(`_user_${id}`)
+}
+
+export function messageText(message) {
+  if (!Array.isArray(message)) return String(message ?? '')
+  return message.filter(item => item?.type === 'text').map(item => item.text || '').join('')
+}
+
+export function formatChatReply(reply, userMessage = '') {
+  const text = cleanCQCodes(reply, true)
+  // 只整理普通聊天的停顿；规范写作、技术内容与原文不做标点改写
+  if (!/[一-龥]/.test(text) || /代码|程序|公式|数学|正则|链接|网址|原文|引用|照抄|翻译|作文|小说|诗|标点|JSON|SQL/i.test(userMessage) ||
+      /`|https?:\/\/|[a-zA-Z]:[\\/]|\b\w+\.\w+|[=<>]/.test(text)) return text
+  return text.replace(/[，。！？；：、,!?;]/g, ' ').replace(/\.(?=\s|$)/g, ' ')
+    .replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').trim()
+}
+
+export function mentionedUserIds(e = {}) {
+  const ids = [...String(e.msg || '').matchAll(/\[CQ:at,qq=(\d+)[^\]]*\]/g)].map(match => match[1])
+  if (Array.isArray(e.message)) {
+    ids.push(...e.message.filter(item => item?.type === 'at' && /^\d+$/.test(String(item.qq))).map(item => String(item.qq)))
+  }
+  return [...new Set(ids)]
 }

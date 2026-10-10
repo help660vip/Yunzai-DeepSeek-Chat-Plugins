@@ -1,185 +1,188 @@
-import { LIMITS, RELATIONSHIP_SYSTEM_PROMPT, RULES, SUMMARY_SYSTEM_PROMPT, SYSTEM_PROMPT } from '../config/config.js'
+import { CHAT_REMINDER, LIMITS, RELATIONSHIP_SYSTEM_PROMPT, RULES, SUMMARY_SYSTEM_PROMPT, SYSTEM_PROMPT } from '../config/config.js'
 import { deepSeekApi } from './api.js'
 import { storageService } from './storage.js'
 import { SocialService } from './social.js'
+import { RequestGuard, RequestLimitError } from './request-guard.js'
+import { buildChatMessages, estimateMessageTokens, estimateTokens, truncateTokenText } from '../utils/context.js'
 import {
-  buildContextId,
-  buildEmotionHint,
-  buildPublicMemoryId,
-  cleanCQCodes,
-  detectEmotion,
-  detectLanguage,
-  extractJson,
-  formatSpeakerLine,
-  isMeaningless,
-  normalizeWhitespace,
-  nowLabel,
-  shouldTriggerMessageReply,
-  inspectSpecialMessage,
-  uniqueExportName
+  buildContextId, buildEmotionHint, buildPublicMemoryId, cleanCQCodes, contextBelongsToUser,
+  detectEmotion, detectLanguage, extractJson, formatChatReply, formatSpeakerLine,
+  isGroupMessage, isMeaningless, messageText, mentionedUserIds, nowLabel, shouldTriggerMessageReply,
+  inspectSpecialMessage, uniqueExportName
 } from '../utils/tools.js'
 
-class ChatService {
-  constructor() {
-    this.storage = storageService
+const isLimitError = error => ['BUSY', 'COOLDOWN', 'RATE_LIMIT', 'DAILY_BUDGET', 'INPUT_TOO_LONG', 'INVALID_USER'].includes(error.code)
+
+export class ChatService {
+  constructor(options = {}) {
+    this.storage = options.storage || storageService
+    this.api = options.api || deepSeekApi
+    this.limits = { ...LIMITS, ...options.limits }
     this.social = new SocialService(this.storage)
-    this.lastReplyTime = new Map()
-    this.processingQueue = new Map()
+    this.guard = options.guard || new RequestGuard(this.limits)
+    this.processingQueue = new Set()
     this.debugMode = false
+    this.archiving = false
     this.interjections = {
       emotion: ['草', '卧槽', '我草', '艹', '绷', '绷不住了', '崩', '笑死', '笑死我了', 'xswl', '牛', '牛逼', '牛批', 'nb', 'NB', '6', '666', '6666', '哈哈', '哈哈哈', 'hhhh', 'hhh', '好家伙', '好耶', 'woc', 'wtf', 'WTF'],
       pureIgnore: ['嗯', '哦', '啊', '呃', '额', '。', '.']
     }
-    this.sensitiveWords = {
-      political: ['习近平', '习大大', 'xjp', '总书记', '毛泽东', '六四', '天安门事件', '法轮功', '台独', '藏独', '疆独', '港独'],
-      nsfw: ['做爱', '性交', 'porn', 'sex', '黄片', 'av', '裸照', '色情', '约炮'],
-      violence: ['杀人', '自杀', '爆炸', '炸弹', '恐怖袭击', '枪支', '刀人'],
-      illegal: ['毒品', '海洛因', '冰毒', '走私', '诈骗', '洗钱', '赌博', '买枪'],
-      discrimination: ['黑鬼', 'nigger', '支那', '小日本', '棒子', '穆畜'],
-      other: ['器官买卖', '人体器官']
-    }
-
-    this.startScheduledTasks()
+    if (options.startTimers !== false) this.startScheduledTasks()
   }
 
-  getRules() {
-    return RULES
-  }
-
+  getRules() { return RULES }
   startScheduledTasks() {
-    setInterval(() => {
-      this.autoArchiveContexts().catch(error => logger?.error?.(`[智能对话] 自动归档失败: ${error.message}`))
+    this.archiveTimer = setInterval(() => {
+      this.autoArchiveContexts().catch(error => globalThis.logger?.error?.(`[智能对话] 自动归档失败 ${error.message}`))
     }, 60 * 60 * 1000)
+    this.archiveTimer.unref?.()
   }
+  close() { clearInterval(this.archiveTimer) }
 
   async dispatch(fnc, e) {
-    if (typeof this[fnc] !== 'function') return false
-    return this[fnc](e)
-  }
-
-  containsSensitiveWord(text) {
-    const normalized = normalizeWhitespace(text).replace(/\s+/g, '').toLowerCase()
-    for (const category of Object.keys(this.sensitiveWords)) {
-      for (const word of this.sensitiveWords[category]) {
-        if (normalized.includes(String(word).toLowerCase())) return { matched: true, category, word }
-      }
+    const rule = RULES.find(item => item.fnc === fnc)
+    if (!rule || typeof this[fnc] !== 'function') return false
+    if (rule.permission === 'master' && e.isMaster !== true) {
+      await e.reply('这个要主人来操作', true)
+      return true
     }
-    return { matched: false }
+    if (e.isMaster !== true && this.isBlacklisted(e)) return false
+    try {
+      return await this[fnc](e)
+    } catch (error) {
+      await this.handleError(e, error)
+      return true
+    }
   }
 
   isBlacklisted(e) {
     const blacklist = this.storage.getBlacklist()
     return blacklist.groups?.includes(String(e.group_id)) || blacklist.users?.includes(String(e.user_id))
   }
-
+  subject(e) {
+    return { userId: e.user_id, isMaster: e.isMaster === true, ...(isGroupMessage(e) ? { groupId: String(e.group_id) } : {}) }
+  }
+  queueKey(e) { if (e.isMaster === true) return buildContextId(e); return isGroupMessage(e) ? `group_${e.group_id}` : `user_${e.user_id}` }
   shouldTriggerReply(e) {
-    const botQQ = e.self_id || e.bot?.uin || globalThis.Bot?.uin
-    return shouldTriggerMessageReply(e, botQQ, LIMITS.randomBubbleChance)
+    return shouldTriggerMessageReply(e, e.self_id || e.bot?.uin || globalThis.Bot?.uin, this.limits.randomBubbleChance)
   }
-
-  checkCooldown(userId) {
-    const now = Date.now()
-    const last = this.lastReplyTime.get(String(userId)) || 0
-    return now - last >= LIMITS.cooldownMs
+  async handleError(e, error) {
+    if (!isLimitError(error)) globalThis.logger?.error?.(`[智能对话] 请求失败 ${error.message}`)
+    if (this.guard.shouldNotify(e.user_id)) await e.reply(isLimitError(error) ? error.message : '出了点问题 等会吧', true)
   }
-
-  setCooldown(userId) {
-    this.lastReplyTime.set(String(userId), Date.now())
+  buildBaseSystemPrompt(e, userMsg) {
+    const emotionHint = buildEmotionHint(detectEmotion(userMsg), detectLanguage(userMsg))
+    // 昵称和群名不能进入 system，避免昵称中的文本被当作规则
+    return `${SYSTEM_PROMPT}\n当前时间 ${nowLabel()}\n当前环境 ${isGroupMessage(e) ? '群聊' : '私聊'}\n${emotionHint}`
   }
-
-  buildBaseSystemPrompt(e, userName, userMsg) {
-    const lang = detectLanguage(userMsg)
-    const emotion = detectEmotion(userMsg)
-    const emotionHint = buildEmotionHint(emotion, lang)
-    let prompt = `${SYSTEM_PROMPT}\n\n当前时间：${nowLabel()}`
-    if (emotionHint) prompt += `\n${emotionHint}`
-    if (e.isGroup) {
-      prompt += `\n当前环境：群聊 ${e.group_name || e.group_id}`
-      prompt += `\n当前对话者：${userName}`
-      prompt += `\n你可以参考给定的最近群聊记录回答 但不要虚构未出现的内容`
-    } else {
-      prompt += `\n当前环境：与 ${userName} 私聊`
-    }
-    return prompt
-  }
-
   async randomDelay() {
-    const delay = 1000 + Math.random() * 2000
-    await new Promise(resolve => setTimeout(resolve, delay))
+    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000))
   }
 
   async callModel(messages, options = {}) {
-    const result = await deepSeekApi.request(messages, options)
-    if (!options.skipStats) this.storage.recordUsage(result.usage)
-    return result.content
-  }
-
-  buildGroupWindowMessages(groupId) {
-    return this.storage.getGroupWindow(groupId).map(item => ({ role: 'user', content: item }))
-  }
-
-  async autoArchiveContexts() {
-    const contextMap = this.storage.getContextMap()
-    let archived = 0
-    for (const [key, value] of contextMap.entries()) {
-      if (key.includes('_public')) continue
-      if (Array.isArray(value) && value.length >= LIMITS.archiveThreshold) {
-        await this.archiveContext(key, value)
-        archived++
-      }
+    const isMaster = options.subject?.isMaster === true
+    if (!isMaster && estimateMessageTokens(messages) > this.limits.maxPromptTokens) {
+      throw new RequestLimitError('INPUT_TOO_LONG', '这条太长了 分几条发吧')
     }
-    if (archived > 0) logger?.info?.(`[智能对话] 自动归档了 ${archived} 个上下文`)
-  }
-
-  async archiveContext(contextId, context) {
-    const recentContext = context.slice(-LIMITS.archiveSummarizeRecent)
-    const prompt = `请总结以下对话 最近对话如下：\n\n${recentContext.map(msg => `${msg.role === 'user' ? '用户' : '助手'}: ${cleanCQCodes(msg.content)}`).join('\n')}\n\n请输出 JSON，格式如下：{"summary":"2到3句总结","profile":{},"facts":["..."]}`
-    const messages = [
-      { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-      { role: 'user', content: prompt }
-    ]
-
-    const raw = await this.callModel(messages, { skipStats: true, temperature: 0.2, maxTokens: 500 })
-    const parsed = extractJson(raw) || { summary: cleanCQCodes(raw), profile: {}, facts: [] }
-    this.storage.appendArchive(contextId, {
-      summary: String(parsed.summary || cleanCQCodes(raw)).trim(),
-      timestamp: Date.now(),
-      messageCount: context.length
-    })
-
-    const userIdMatch = contextId.match(/user_(\d+)/)
-    if (userIdMatch) {
-      this.storage.mergeImportantFacts(userIdMatch[1], {
-        profile: parsed.profile || {},
-        facts: Array.isArray(parsed.facts) ? parsed.facts : []
+    this.api.ensureConfigured()
+    const release = this.guard.acquire(options.subject)
+    const maxTokens = isMaster
+      ? (options.maxTokens ?? this.api.config.masterMaxTokens ?? null)
+      : Math.min(options.maxTokens ?? this.api.config.maxTokens, this.api.config.maxTokens)
+    const estimate = estimateMessageTokens(messages) + (maxTokens || 0)
+    let reservation
+    try {
+      const result = await this.api.request(messages, {
+        ...options, maxTokens, isMaster,
+        beforeAttempt: async () => {
+          if (!isMaster) reservation = await this.storage.reserveTokenBudget(options.subject, estimate, this.limits)
+        },
+        onUsage: async (usage, content) => {
+          this.storage.recordUsage(usage || {
+            prompt_tokens: estimateMessageTokens(messages),
+            completion_tokens: typeof content === 'string' ? estimateTokens(content) : 0
+          })
+          if (reservation && usage) await this.storage.settleTokenBudget(reservation, usage)
+        }
       })
+      return result.content
+    } finally {
+      release()
     }
-
-    const nextContext = context.slice(-LIMITS.archiveKeepRecent)
-    this.storage.replaceContext(contextId, nextContext)
   }
 
-  async archiveContexts(e) {
-    await e.reply('开始归档 请稍等', true)
+  async runArchiveBatch(threshold, actor) {
+    if (this.archiving) return 0
+    this.archiving = true
     let archived = 0
-    for (const [key, value] of this.storage.getContextMap().entries()) {
-      if (key.includes('_public')) continue
-      if (Array.isArray(value) && value.length > 100) {
-        await this.archiveContext(key, value)
-        archived++
+    let attempted = 0
+    try {
+      for (const [key, value] of [...this.storage.getContextMap().entries()]) {
+        if (key.endsWith('_public') || !Array.isArray(value) || value.length < threshold) continue
+        if (actor?.isMaster !== true && attempted >= this.limits.maxArchivesPerRun) break
+        attempted++
+        try {
+          if (await this.archiveContext(key, value, actor)) archived++
+        } catch (error) {
+          if (isLimitError(error)) break
+          globalThis.logger?.error?.(`[智能对话] 归档失败 ${error.message}`)
+        }
       }
+      return archived
+    } finally { this.archiving = false }
+  }
+  async autoArchiveContexts() { return this.runArchiveBatch(this.limits.archiveThreshold) }
+
+  async archiveContext(contextId, context, actor) {
+    const match = contextId.match(/^(?:group_(\d+)_)?user_(\d+)$/)
+    if (!match) return false
+    const subject = actor?.isMaster === true ? actor : { userId: match[2], ...(match[1] ? { groupId: match[1] } : {}) }
+    const queueKey = match[1] ? `group_${match[1]}` : `user_${match[2]}`
+    const userKey = `user_${match[2]}`
+    if (this.processingQueue.has(queueKey) || this.processingQueue.has(userKey)) return false
+    this.processingQueue.add(queueKey)
+    this.processingQueue.add(userKey)
+    try {
+      const previous = this.storage.getArchives().get(contextId)?.at(-1)?.summary || ''
+      const rows = []
+      const system = { role: 'system', content: `${SUMMARY_SYSTEM_PROMPT}\n当前用户QQ ${match[2]}` }
+      const makeMessages = () => [system, { role: 'user', content: JSON.stringify({
+        previousSummary: truncateTokenText(previous, 2000), messages: rows
+      }) }]
+      // 总结最早的消息，只移除确实送入摘要的部分，不能总结最近100条却删除前350条
+      const count = Math.min(this.limits.archiveSummarizeRecent, context.length - this.limits.archiveKeepRecent)
+      for (const msg of context.slice(0, Math.max(0, count))) {
+        rows.push({ role: msg.role, content: msg.content })
+        if (subject.isMaster !== true && estimateMessageTokens(makeMessages()) > this.limits.maxPromptTokens) { rows.pop(); break }
+      }
+      if (!rows.length) return false
+      const raw = await this.callModel(makeMessages(), { subject, temperature: 0.2, maxTokens: 500 })
+      const parsed = extractJson(raw)
+      if (!parsed || typeof parsed.summary !== 'string' || !parsed.summary.trim()) throw new Error('摘要格式无效 原记录已保留')
+      // 清空指令或其他操作改变了上下文时，丢弃旧请求的归档结果
+      if (this.storage.getContextMap().get(contextId) !== context) return false
+      this.storage.appendArchive(contextId, { summary: parsed.summary.trim(), timestamp: Date.now(), messageCount: rows.length })
+      this.storage.mergeImportantFacts(contextId, { profile: parsed.profile, facts: parsed.facts })
+      this.storage.replaceContext(contextId, context.slice(rows.length))
+      return true
+    } finally {
+      this.processingQueue.delete(queueKey)
+      this.processingQueue.delete(userKey)
     }
-    await e.reply(`归档完成 处理了${archived}个上下文`, true)
+  }
+  async archiveContexts(e) {
+    const archived = await this.runArchiveBatch(101, this.subject(e))
+    await e.reply(`这次归档了${archived}个上下文${e.isMaster === true ? '' : ` 每次最多处理${this.limits.maxArchivesPerRun}个`}`, true)
     return true
   }
-
   async showTokenStats(e) {
-    if (e.isGroup) {
+    if (isGroupMessage(e)) {
       await e.reply('请私聊查看 Token 统计', true)
       return true
     }
     const stats = this.storage.getStats()
-    await e.reply(`Token使用统计：\n总调用次数: ${stats.totalCalls}\n总Token消耗: ${stats.totalTokens}\n输入Token: ${stats.promptTokens}\n输出Token: ${stats.completionTokens}\n统计开始时间: ${new Date(stats.lastReset).toLocaleString('zh-CN')}`, true)
+    const daily = this.storage.getDailyBudget()
+    await e.reply(`Token使用统计：\n总调用次数: ${stats.totalCalls}\n总Token消耗: ${stats.totalTokens}\n输入Token: ${stats.promptTokens}\n输出Token: ${stats.completionTokens}\n今日预算占用: ${daily.used.global || 0}/${this.limits.dailyGlobalTokens} (${daily.day})\n统计开始时间: ${new Date(stats.lastReset).toLocaleString('zh-CN')}`, true)
     return true
   }
 
@@ -198,7 +201,7 @@ class ChatService {
 
   async clearMyContext(e) {
     const contextId = buildContextId(e)
-    if (this.storage.clearConversationData(contextId, e.user_id)) {
+    if (this.storage.clearConversationData(contextId)) {
       await e.reply('好 你的记录清掉了', true)
     } else {
       await e.reply('本来就没什么记录', true)
@@ -289,11 +292,12 @@ class ChatService {
   }
 
   async analyzeRelationship(e) {
-    if (!e.isGroup) {
+    if (!isGroupMessage(e)) {
       await e.reply('这个功能只能在群里使用', true)
       return true
     }
-    const atList = [...e.msg.matchAll(/\[CQ:at,qq=(\d+)\]/g)].map(match => match[1])
+    const botId = e.self_id || e.bot?.uin || globalThis.Bot?.uin
+    const atList = mentionedUserIds(e).filter(id => id !== String(botId))
     if (atList.length !== 2) {
       await e.reply('请@两个人来查询关系 例如：#查询关系 @A @B', true)
       return true
@@ -317,13 +321,13 @@ class ChatService {
     const analysis = await this.callModel([
       { role: 'system', content: RELATIONSHIP_SYSTEM_PROMPT },
       { role: 'user', content: `根据以下数据分析两人关系 用1到2句话概括：\n${name1}(${user1})和${name2}(${user2})\n总互动${rel.interactionCount}次 @${rel.atCount}次 回复${rel.replyCount}次\n情绪统计:${JSON.stringify(rel.emotionStats)} 总计:${total}\n常聊话题:${topTopics}\n最近对话:${recentMsg}` }
-    ], { temperature: 0.4, maxTokens: 120 })
-    await e.reply(`${name1} 和 ${name2} 的关系：\n${analysis}`, true)
+    ], { temperature: 0.4, maxTokens: 120, subject: this.subject(e) })
+    await e.reply(`${name1} 和 ${name2} 的关系：\n${formatChatReply(analysis)}`, true)
     return true
   }
 
   async showGroupRelationships(e) {
-    if (!e.isGroup) {
+    if (!isGroupMessage(e)) {
       await e.reply('这个功能只能在群里使用', true)
       return true
     }
@@ -342,7 +346,7 @@ class ChatService {
   }
 
   async showMySocialStats(e) {
-    if (!e.isGroup) {
+    if (!isGroupMessage(e)) {
       await e.reply('这个功能只能在群里使用', true)
       return true
     }
@@ -384,7 +388,7 @@ class ChatService {
     const atMatch = e.msg.match(/\[CQ:at,qq=(\d+)\]/)
     let targetUserId = e.user_id
     if (atMatch) {
-      if (!e.isMaster) {
+      if (e.isMaster !== true) {
         await e.reply('只有主人可以查看别人的对话统计', true)
         return true
       }
@@ -393,7 +397,7 @@ class ChatService {
 
     const userContexts = []
     for (const [key, value] of this.storage.getContextMap().entries()) {
-      if (key.includes(`_user_${targetUserId}`) && !key.includes('_public')) userContexts.push(...value)
+      if (contextBelongsToUser(key, targetUserId)) userContexts.push(...value)
     }
     if (userContexts.length === 0) {
       await e.reply('暂无对话记录', true)
@@ -438,7 +442,7 @@ class ChatService {
     const targetUserId = atMatch[1]
     const userContexts = []
     for (const [key, value] of this.storage.getContextMap().entries()) {
-      if (key.includes(`_user_${targetUserId}`) && !key.includes('_public')) userContexts.push(...value)
+      if (contextBelongsToUser(key, targetUserId)) userContexts.push(...value)
     }
     if (userContexts.length === 0) {
       await e.reply('该用户暂无对话记录', true)
@@ -454,7 +458,7 @@ class ChatService {
   }
 
   async exportGroupHistory(e) {
-    if (!e.isGroup) {
+    if (!isGroupMessage(e)) {
       await e.reply('这个功能只能在群里使用', true)
       return true
     }
@@ -473,147 +477,98 @@ class ChatService {
     return true
   }
 
-  async isReplyToBot(e) {
-    try {
-      const botQQ = e.self_id || Bot.uin || e.bot?.uin
-      if (!botQQ || !e.source) return false
-      const sourceUserId = String(e.source.user_id || e.source.sender?.user_id || '')
-      return sourceUserId === String(botQQ)
-    } catch {
-      return false
-    }
-  }
-
   async getQuotedMessage(e) {
     try {
-      if (typeof e.getReply === 'function') {
-        const reply = await e.getReply()
-        if (reply?.message) return cleanCQCodes(String(reply.message))
+      let reply
+      if (typeof e.getReply === 'function') reply = await e.getReply()
+      let text = reply?.message || reply?.raw_message || e.source?.message || e.source?.raw_message
+      if (!text && (e.source?.seq || e.source?.message_id) && isGroupMessage(e)) {
+        const group = (e.bot || globalThis.Bot)?.pickGroup?.(e.group_id)
+        const history = await group?.getChatHistory?.(e.source.seq || e.source.message_id, 1)
+        text = history?.[0]?.message || history?.[0]?.raw_message
       }
-      if (e.source?.message) return cleanCQCodes(String(e.source.message))
-      if (e.source?.raw_message) return cleanCQCodes(String(e.source.raw_message))
-      if ((e.source?.seq || e.source?.message_id) && e.isGroup && e.group_id) {
-        const msgId = e.source.seq || e.source.message_id
-        const group = Bot.pickGroup(e.group_id)
-        if (group && typeof group.getChatHistory === 'function') {
-          const history = await group.getChatHistory(msgId, 1)
-          if (history?.[0]?.message) return cleanCQCodes(String(history[0].message))
-        }
-      }
+      const cleaned = cleanCQCodes(messageText(text), true)
+      return (e.isMaster === true ? cleaned : cleaned.slice(0, this.limits.maxQuotedChars)) || null
     } catch (error) {
-      logger?.error?.(`[智能对话] 获取引用消息失败: ${error.message}`)
+      globalThis.logger?.error?.(`[智能对话] 获取引用失败 ${error.message}`)
+      return null
     }
-    return null
   }
 
-  async sendReply(e, cleanReply) {
-    const text = String(cleanReply).trim()
-    // 直接发送，不再限制长度或转合并转发
-    await e.reply(text, true)
-  }
+  async sendReply(e, reply) { await e.reply(String(reply).trim(), true) }
 
   async chat(e) {
-    const selfId = e.self_id || Bot.uin || e.bot?.uin
-    if (String(e.user_id) === String(selfId)) return false
-    if (this.isBlacklisted(e)) return false
-
-    const userName = e.sender?.card || e.sender?.nickname || String(e.user_id)
-    const rawMsg = e.msg || ''
-    const cleanedMsg = cleanCQCodes(rawMsg)
+    const selfId = e.self_id || e.bot?.uin || globalThis.Bot?.uin
+    if (!e.user_id || (selfId != null && String(e.user_id) === String(selfId)) || this.isBlacklisted(e)) return false
+    const rawMsg = String(e.msg || messageText(e.message))
+    if (rawMsg.trimStart().startsWith('#')) return false
+    const cleanedMsg = cleanCQCodes(rawMsg, true)
     if (!cleanedMsg) return false
-
-    if (e.isGroup) {
-      this.storage.pushGroupWindow(e.group_id, formatSpeakerLine(userName, cleanedMsg))
+    const triggered = this.shouldTriggerReply(e)
+    if (e.isMaster !== true && cleanedMsg.length > this.limits.maxMessageChars) {
+      if (triggered) await this.handleError(e, new RequestLimitError('INPUT_TOO_LONG', '这条太长了 分几条发吧'))
+      return triggered
     }
+    const userName = String(e.sender?.card || e.sender?.nickname || e.user_id).slice(0, 80)
+    if (isGroupMessage(e)) this.storage.pushGroupWindow(e.group_id, formatSpeakerLine(userName, cleanedMsg))
+    this.social.recordGroupMessage(e, selfId)
+    if (!triggered) return false
 
-    const queueKey = e.isGroup ? `group_${e.group_id}` : `user_${e.user_id}`
-
-    if (!this.shouldTriggerReply(e)) return false
-
-    const special = inspectSpecialMessage(cleanedMsg, this.interjections)
-    if (!special.useAPI) {
-      if (special.shouldReply) await e.reply(special.content, true)
-      return special.shouldReply
-    }
-
-    if (!this.storage.canPassRateLimit(e.user_id)) {
-      await e.reply('你问得太快啦 休息一下吧', true)
-      return true
-    }
-
-    if (!this.checkCooldown(e.user_id)) return false
-    if (this.processingQueue.get(queueKey)) return false
-    this.processingQueue.set(queueKey, true)
-
+    const queueKey = this.queueKey(e)
+    const userKey = `user_${e.user_id}`
+    if (this.processingQueue.has(queueKey) || this.processingQueue.has(userKey)) return true
+    this.processingQueue.add(queueKey)
+    this.processingQueue.add(userKey)
     const startedAt = Date.now()
     try {
-      await this.randomDelay()
-
+      const special = inspectSpecialMessage(cleanedMsg, this.interjections)
+      if (!special.useAPI) {
+        if (special.shouldReply && this.guard.shouldNotify(e.user_id)) await e.reply(special.content, true)
+        return special.shouldReply
+      }
+      // 用快照组装请求，失败或清空期间不把未完成消息写进记忆
       const contextId = buildContextId(e)
-      const publicMemoryId = e.isGroup ? buildPublicMemoryId(e.group_id) : null
       const context = this.storage.getContext(contextId)
-      const publicMemory = publicMemoryId ? this.storage.getContext(publicMemoryId) : []
+      const publicMemoryId = isGroupMessage(e) ? buildPublicMemoryId(e.group_id) : null
+      const window = isGroupMessage(e) ? this.storage.getGroupWindow(e.group_id).slice(0, -1) : []
+      const groupRecords = window.length ? window : (this.storage.getContextMap().get(publicMemoryId) || []).map(msg => msg.content)
       const quoted = e.source ? await this.getQuotedMessage(e) : null
-      if (quoted) {
-        context.push({ role: 'assistant', content: quoted, timestamp: Date.now() })
-      }
-
-      context.push({ role: 'user', content: cleanedMsg, timestamp: Date.now() })
-      if (publicMemoryId && !isMeaningless(cleanedMsg)) {
-        publicMemory.push({ role: 'user', content: formatSpeakerLine(userName, cleanedMsg), timestamp: Date.now() })
-        if (publicMemory.length > LIMITS.maxPublicMemory) publicMemory.splice(0, publicMemory.length - LIMITS.maxPublicMemory)
-      }
-
-      const systemPrompt = this.buildBaseSystemPrompt(e, userName, cleanedMsg)
-      const messages = [{ role: 'system', content: systemPrompt }]
-      if (e.isGroup) {
-        const groupWindow = this.buildGroupWindowMessages(e.group_id)
-        if (groupWindow.length) messages.push({ role: 'system', content: `最近群聊记录：\n${groupWindow.map(item => item.content).join('\n')}` })
-      }
-
       const archive = this.storage.getArchives().get(contextId)?.at(-1)
-      if (archive?.summary) messages.push({ role: 'system', content: `历史对话摘要：${archive.summary}` })
-
-      const info = this.storage.getImportantInfo().get(`user_${e.user_id}_info`)
-      if (info) {
-        const facts = (info.facts || []).slice(-5).map(item => item.content).join('; ')
-        if (facts) messages.push({ role: 'system', content: `已知用户信息：${facts}` })
+      const info = this.storage.getImportantInfo().get(`${contextId}_info`)
+      const background = [
+        { kind: '当前对话者', text: JSON.stringify({ name: userName, userId: String(e.user_id), groupName: String(e.group_name || '').slice(0, 80) }) },
+        ...(quoted ? [{ kind: '用户引用的消息', text: quoted }] : []),
+        ...(info?.facts?.length ? [{ kind: '当前会话用户事实', text: info.facts.slice(-5).map(item => item.content).join('\n') }] : []),
+        ...(archive?.summary ? [{ kind: '当前会话历史摘要', text: archive.summary }] : []),
+        ...(isGroupMessage(e) ? groupRecords.slice(-this.limits.recentGroupWindow).reverse().map(text => ({ kind: '群聊发言', text })) : [])
+      ]
+      const messages = buildChatMessages({
+        systemPrompt: this.buildBaseSystemPrompt(e, cleanedMsg), reminder: CHAT_REMINDER,
+        history: context, current: cleanedMsg, background, isMaster: e.isMaster === true
+      }, this.limits)
+      const reply = await this.callModel(messages, { subject: this.subject(e) })
+      const cleanReply = formatChatReply(reply, cleanedMsg)
+      if (!cleanReply) throw new Error('API返回空回复')
+      if (this.storage.getContextMap().get(contextId) !== context) return true
+      await this.randomDelay()
+      if (this.storage.getContextMap().get(contextId) !== context) return true
+      const outgoing = this.debugMode ? `${cleanReply}\n[调试] 上下文:${context.length}条 Token:${this.storage.getStats().totalTokens} 耗时:${Date.now() - startedAt}ms` : cleanReply
+      await this.sendReply(e, outgoing)
+      if (this.storage.getContextMap().get(contextId) !== context) return true
+      this.storage.appendContext(contextId, { role: 'user', content: cleanedMsg, timestamp: startedAt })
+      this.storage.appendContext(contextId, { role: 'assistant', content: cleanReply, timestamp: Date.now() })
+      if (publicMemoryId) {
+        if (!isMeaningless(cleanedMsg)) this.storage.appendContext(publicMemoryId, { role: 'user', content: formatSpeakerLine(userName, cleanedMsg), timestamp: startedAt })
+        if (!isMeaningless(cleanReply)) this.storage.appendContext(publicMemoryId, { role: 'assistant', content: formatSpeakerLine('机器人', cleanReply), timestamp: Date.now() })
       }
-
-      messages.push({
-        role: 'system',
-        content: '历史对话只用于理解事实和指代 不要模仿历史回复的篇幅和格式 当前回答长度只由这次问题的内容决定'
-      })
-      messages.push(...context)
-      const reply = await this.callModel(messages)
-      const cleanReply = String(reply).replace(/\[CQ:[^\]]+\]/g, ' ').trim()
-
-      // 已移除本地敏感词审查，完全依赖 DeepSeek 模型自身的安全机制
-      // 避免误杀正常创作内容（如作文、小说、英语学习等场景）
-
-      context.push({ role: 'assistant', content: cleanReply, timestamp: Date.now() })
-      if (publicMemoryId && !isMeaningless(cleanReply)) {
-        publicMemory.push({ role: 'assistant', content: formatSpeakerLine('机器人', cleanReply), timestamp: Date.now() })
-        if (publicMemory.length > LIMITS.maxPublicMemory) publicMemory.splice(0, publicMemory.length - LIMITS.maxPublicMemory)
-      }
-
-      this.storage.scheduleFlush('context')
-      this.setCooldown(e.user_id)
-      this.social.recordInteraction(e, String(selfId))
-
-      if (this.debugMode) {
-        const duration = Date.now() - startedAt
-        await this.sendReply(e, `${cleanReply}\n[调试] 上下文:${context.length}条 Token:${this.storage.getStats().totalTokens} 耗时:${duration}ms`)
-      } else {
-        await this.sendReply(e, cleanReply)
-      }
+      this.social.recordInteraction(e, selfId == null ? null : String(selfId))
       return true
     } catch (error) {
-      logger?.error?.(`[智能对话] API错误: ${error.message}`)
-      await e.reply('出了点问题 等会吧', true)
-      return false
+      await this.handleError(e, error)
+      return true
     } finally {
       this.processingQueue.delete(queueKey)
+      this.processingQueue.delete(userKey)
     }
   }
 }

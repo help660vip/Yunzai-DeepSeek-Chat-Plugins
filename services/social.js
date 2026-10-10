@@ -1,4 +1,4 @@
-import { formatRelationshipKey, detectEmotion, cleanCQCodes } from '../utils/tools.js'
+import { formatRelationshipKey, detectEmotion, cleanCQCodes, isGroupMessage, mentionedUserIds } from '../utils/tools.js'
 import { LIMITS } from '../config/config.js'
 
 export class SocialService {
@@ -6,12 +6,25 @@ export class SocialService {
     this.storage = storage
   }
 
+  recordGroupMessage(e, botId) {
+    if (!isGroupMessage(e)) return
+    const targets = new Set(mentionedUserIds(e))
+    const sourceId = e.source?.user_id || e.source?.sender?.user_id
+    if (sourceId) targets.add(String(sourceId))
+    let count = 0
+    for (const target of targets) {
+      if (target === String(e.user_id) || target === String(botId) || !/^\d+$/.test(target)) continue
+      if (count++ >= 5) break
+      this.recordInteraction(e, target)
+    }
+  }
+
   recordInteraction(e, targetUserId = null) {
-    if (!e.isGroup || !targetUserId) return
+    if (!isGroupMessage(e) || !targetUserId) return
 
     const groupId = String(e.group_id)
     const userId = String(e.user_id)
-    const userName = e.sender?.card || e.sender?.nickname || userId
+    const userName = String(e.sender?.card || e.sender?.nickname || userId).slice(0, 80)
     const targetName = String(targetUserId) === String(e.self_id || e.bot?.uin || '')
       ? '机器人'
       : String(targetUserId)
@@ -40,8 +53,10 @@ export class SocialService {
     const rel = relationships[groupId].relationships[key]
     rel.interactionCount++
     rel.lastInteraction = Date.now()
-    if (e.atBot || cleanCQCodes(e.msg).includes(String(targetUserId))) rel.atCount++
-    else if (e.source) rel.replyCount++
+    const target = String(targetUserId)
+    const botId = e.self_id || e.bot?.uin || globalThis.Bot?.uin
+    if (mentionedUserIds(e).includes(target) || (e.atBot && target === String(botId))) rel.atCount++
+    if (String(e.source?.user_id || e.source?.sender?.user_id || '') === target) rel.replyCount++
 
     const emotion = detectEmotion(e.msg)
     rel.emotionStats[emotion]++
@@ -51,10 +66,14 @@ export class SocialService {
       .split(/\s+/)
       .filter(word => word.length >= 2)
       .slice(0, 3)
+      .map(word => word.slice(0, 40))
 
     for (const word of keywords) {
-      rel.topics[word] = (rel.topics[word] || 0) + 1
+      rel.topics[word] = (Number.isFinite(rel.topics[word]) ? rel.topics[word] : 0) + 1
     }
+
+    rel.topics = Object.fromEntries(Object.entries(rel.topics).filter(([, count]) => Number.isFinite(count))
+      .reverse().sort((a, b) => b[1] - a[1]).slice(0, LIMITS.maxTopicsPerRelationship))
 
     rel.recentMessages.push({
       from: userId,

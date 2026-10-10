@@ -1,375 +1,266 @@
-import fs from 'fs'
-import path from 'path'
-import { BACKUP_DIR, DATA_DIR, EXPORT_DIR, FILE_PATHS, LIMITS } from '../config/config.js'
+import fs from 'node:fs'
+import path from 'node:path'
+import { DATA_DIR, LIMITS } from '../config/config.js'
 import { clampArray } from '../utils/tools.js'
-
-// 文件锁管理器，防止并发写入冲突
-class FileLockManager {
-  constructor() {
-    this.locks = new Map()
-  }
-
-  async acquire(filePath) {
-    while (this.locks.get(filePath)) {
-      await new Promise(resolve => setTimeout(resolve, 50))
-    }
-    this.locks.set(filePath, true)
-  }
-
-  release(filePath) {
-    this.locks.delete(filePath)
-  }
-}
-
-const fileLockManager = new FileLockManager()
+import { RequestLimitError } from './request-guard.js'
 
 function readJson(filePath, fallback) {
   try {
     if (!fs.existsSync(filePath)) return fallback
-    const content = fs.readFileSync(filePath, 'utf-8')
-    if (!content.trim()) return fallback
-    return JSON.parse(content)
+    return JSON.parse(fs.readFileSync(filePath, 'utf8')) ?? fallback
   } catch (error) {
-    logger?.warn?.(`[存储] 读取 ${filePath} 失败，使用默认值：${error.message}`)
+    globalThis.logger?.warn?.(`[存储] 读取 ${filePath} 失败 ${error.message}`)
     return fallback
   }
 }
 
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-}
+const nonnegative = value => Number.isSafeInteger(value) && value >= 0 ? value : 0
+const budgetDay = now => new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
 
 export class StorageService {
-  constructor() {
-    ensureDir(DATA_DIR)
-    ensureDir(BACKUP_DIR)
-    ensureDir(EXPORT_DIR)
-
-    this.contextMap = new Map(Object.entries(readJson(FILE_PATHS.context, {})))
-    this.archives = new Map(Object.entries(readJson(FILE_PATHS.archive, {})))
-    this.importantInfo = new Map(Object.entries(readJson(FILE_PATHS.important, {})))
-    this.stats = readJson(FILE_PATHS.stats, {
-      totalCalls: 0,
-      totalTokens: 0,
-      promptTokens: 0,
-      completionTokens: 0,
-      lastReset: Date.now()
-    })
-    this.blacklist = readJson(FILE_PATHS.blacklist, { groups: [], users: [] })
-    this.relationships = readJson(FILE_PATHS.relationships, {})
-    this.meta = readJson(FILE_PATHS.meta, { lastBackupDate: null })
-
-    // 异步写入队列和防抖控制
+  constructor(options = {}) {
+    this.dataDir = options.dataDir || DATA_DIR
+    this.backupDir = path.join(this.dataDir, 'backup')
+    this.exportDir = path.join(this.dataDir, 'exports')
+    this.filePaths = Object.fromEntries(['context', 'stats', 'important', 'archive', 'blacklist', 'relationships', 'meta']
+      .map(key => [key, path.join(this.dataDir, `${key}.json`)]))
+    for (const dir of [this.dataDir, this.backupDir, this.exportDir]) fs.mkdirSync(dir, { recursive: true })
+    this.contextMap = new Map(Object.entries(readJson(this.filePaths.context, {}))
+      .filter(([, value]) => Array.isArray(value))
+      .map(([key, value]) => [key, value.filter(msg => typeof msg?.content === 'string' && ['user', 'assistant'].includes(msg.role))
+        .slice(-(key.endsWith('_public') ? LIMITS.maxPublicMemory : LIMITS.maxContext))]))
+    this.archives = new Map(Object.entries(readJson(this.filePaths.archive, {})).filter(([, value]) => Array.isArray(value)))
+    this.importantInfo = new Map(Object.entries(readJson(this.filePaths.important, {})))
+    this.stats = readJson(this.filePaths.stats, {})
+    for (const key of ['totalCalls', 'totalTokens', 'promptTokens', 'completionTokens']) this.stats[key] = nonnegative(this.stats[key])
+    this.stats.lastReset ||= Date.now()
+    this.blacklist = readJson(this.filePaths.blacklist, { groups: [], users: [] })
+    this.relationships = readJson(this.filePaths.relationships, {})
+    this.meta = readJson(this.filePaths.meta, { lastBackupDate: null })
     this.writeQueue = []
     this.isWriting = false
     this.writeDebounceTimers = new Map()
-    
     this.groupWindows = new Map()
-    this.rateLimitCounter = new Map()
-
-    this.rateLimitResetTimer = setInterval(() => {
-      this.rateLimitCounter.clear()
-    }, 60 * 1000)
-
-    // 备份检查改为每小时一次
-    this.backupTimer = setInterval(() => {
-      this.maybeBackup().catch(error => logger?.error?.(`[存储] 备份失败：${error.message}`))
-    }, 60 * 60 * 1000)
-
-    // 启动异步写入处理器
-    this.startWriteProcessor()
-  }
-
-  // 启动后台写入处理器，按顺序处理写入请求
-  startWriteProcessor() {
-    const processQueue = async () => {
-      if (this.isWriting || this.writeQueue.length === 0) return
-      
-      this.isWriting = true
-      const task = this.writeQueue.shift()
-      
-      try {
-        await this.atomicWrite(task.filePath, task.data)
-        task.resolve()
-      } catch (error) {
-        logger?.error?.(`[存储] 原子写入失败：${error.message}`)
-        task.reject(error)
-      } finally {
-        this.isWriting = false
-        setImmediate(processQueue)
-      }
+    this.tempCounter = 0
+    if (options.startTimers !== false) {
+      this.backupTimer = setInterval(() => {
+        this.maybeBackup().catch(error => globalThis.logger?.error?.(`[存储] 备份失败 ${error.message}`))
+      }, 60 * 60 * 1000)
+      this.backupTimer.unref?.()
     }
-
-    // 简单轮询处理队列
-    setInterval(() => {
-      if (this.writeQueue.length > 0 && !this.isWriting) {
-        processQueue()
-      }
-    }, 100)
   }
 
-  // 原子写入：先写临时文件，再重命名，确保断电不丢数据
-  async atomicWrite(filePath, data) {
-    await fileLockManager.acquire(filePath)
-    
+  async processWriteQueue() {
+    if (this.isWriting) return
+    this.isWriting = true
     try {
-      const tempPath = `${filePath}.tmp.${Date.now()}`
-      const serialized = JSON.stringify(data, null, 2)
-      
-      // 写入临时文件
-      await fs.promises.writeFile(tempPath, serialized, 'utf-8')
-      const fd = await fs.promises.open(tempPath, 'r+')
-      await fd.sync()
-      await fd.close()
-      
-      // 原子重命名
-      await fs.promises.rename(tempPath, filePath)
-      
-      logger?.debug?.(`[存储] 原子写入成功：${filePath}`)
-    } catch (error) {
-      // 清理可能残留的临时文件
-      const dir = path.dirname(filePath)
-      const baseName = path.basename(filePath)
-      if (fs.existsSync(dir)) {
-        const files = await fs.promises.readdir(dir)
-        for (const file of files) {
-          if (file.startsWith(baseName + '.tmp.')) {
-            await fs.promises.unlink(path.join(dir, file)).catch(() => {})
-          }
+      while (this.writeQueue.length) {
+        const task = this.writeQueue.shift()
+        try {
+          await this.atomicWrite(task.filePath, task.data)
+          task.resolve()
+        } catch (error) {
+          globalThis.logger?.error?.(`[存储] 写入失败 ${error.message}`)
+          task.reject(error)
         }
       }
-      throw error
     } finally {
-      fileLockManager.release(filePath)
+      this.isWriting = false
     }
   }
 
-  // 带防抖的调度写入，避免频繁写盘
+  async atomicWrite(filePath, data) {
+    const tempPath = `${filePath}.tmp.${process.pid}.${this.tempCounter++}`
+    try {
+      await fs.promises.writeFile(tempPath, JSON.stringify(data, null, 2), 'utf8')
+      const fd = await fs.promises.open(tempPath, 'r+')
+      try { await fd.sync() } finally { await fd.close() }
+      await fs.promises.rename(tempPath, filePath)
+    } catch (error) {
+      await fs.promises.unlink(tempPath).catch(() => {})
+      throw error
+    }
+  }
+
   scheduleFlush(key) {
-    if (this.writeDebounceTimers.has(key)) {
-      clearTimeout(this.writeDebounceTimers.get(key))
-    }
-    
-    const timer = setTimeout(() => {
-      this.enqueueWrite(key)
+    // 第一次变脏后一秒落盘，持续群消息不会无限推迟写入
+    if (this.writeDebounceTimers.has(key)) return
+    this.writeDebounceTimers.set(key, setTimeout(() => {
       this.writeDebounceTimers.delete(key)
-    }, 1000)
-    
-    this.writeDebounceTimers.set(key, timer)
+      this.enqueueWrite(key).catch(error => globalThis.logger?.error?.(`[存储] 刷新失败 ${error.message}`))
+    }, 1000))
   }
 
-  // 将写入任务加入队列
   enqueueWrite(key) {
     const mapping = {
-      context: () => ({ data: Object.fromEntries(this.contextMap), filePath: FILE_PATHS.context }),
-      archive: () => ({ data: Object.fromEntries(this.archives), filePath: FILE_PATHS.archive }),
-      important: () => ({ data: Object.fromEntries(this.importantInfo), filePath: FILE_PATHS.important }),
-      stats: () => ({ data: this.stats, filePath: FILE_PATHS.stats }),
-      blacklist: () => ({ data: this.blacklist, filePath: FILE_PATHS.blacklist }),
-      relationships: () => ({ data: this.relationships, filePath: FILE_PATHS.relationships }),
-      meta: () => ({ data: this.meta, filePath: FILE_PATHS.meta })
+      context: () => Object.fromEntries(this.contextMap),
+      archive: () => Object.fromEntries(this.archives),
+      important: () => Object.fromEntries(this.importantInfo),
+      stats: () => this.stats,
+      blacklist: () => this.blacklist,
+      relationships: () => this.relationships,
+      meta: () => this.meta
     }
-
-    const getter = mapping[key]
-    if (!getter) return Promise.resolve()
-    
-    const { data, filePath } = getter()
-    
+    if (!mapping[key]) return Promise.resolve()
+    // 入队时固定快照，避免异步写盘期间引用又被修改
+    const data = JSON.parse(JSON.stringify(mapping[key]()))
     return new Promise((resolve, reject) => {
-      this.writeQueue.push({ filePath, data, resolve, reject })
+      this.writeQueue.push({ filePath: this.filePaths[key], data, resolve, reject })
+      void this.processWriteQueue()
     })
   }
 
-  // 强制立即刷新所有待写入数据
   async flushAll() {
-    const pending = [...this.writeDebounceTimers.keys()]
-    for (const key of pending) {
+    for (const key of [...this.writeDebounceTimers.keys()]) {
       clearTimeout(this.writeDebounceTimers.get(key))
       this.writeDebounceTimers.delete(key)
       await this.enqueueWrite(key)
     }
-    
-    while (this.writeQueue.length > 0 || this.isWriting) {
-      await new Promise(resolve => setTimeout(resolve, 50))
-    }
+    while (this.writeQueue.length || this.isWriting) await new Promise(resolve => setTimeout(resolve, 10))
   }
 
-  getContextMap() {
-    return this.contextMap
+  async close() {
+    clearInterval(this.backupTimer)
+    await this.flushAll()
   }
 
+  getContextMap() { return this.contextMap }
   getContext(contextId) {
     if (!this.contextMap.has(contextId)) this.contextMap.set(contextId, [])
     return this.contextMap.get(contextId)
   }
-
   appendContext(contextId, message) {
     const context = this.getContext(contextId)
     context.push(message)
-    clampArray(context, LIMITS.maxContext)
+    clampArray(context, contextId.endsWith('_public') ? LIMITS.maxPublicMemory : LIMITS.maxContext)
     this.scheduleFlush('context')
     return context
   }
-
   replaceContext(contextId, nextContext) {
-    this.contextMap.set(contextId, nextContext)
+    this.contextMap.set(contextId, nextContext.slice(-(contextId.endsWith('_public') ? LIMITS.maxPublicMemory : LIMITS.maxContext)))
     this.scheduleFlush('context')
   }
-
   deleteContext(contextId) {
     this.contextMap.delete(contextId)
     this.scheduleFlush('context')
   }
-
-  clearConversationData(contextId, userId) {
-    const deletedContext = this.contextMap.delete(contextId)
-    const deletedArchive = this.archives.delete(contextId)
-    const deletedImportant = this.importantInfo.delete(`user_${userId}_info`)
-
-    if (deletedContext) this.scheduleFlush('context')
-    if (deletedArchive) this.scheduleFlush('archive')
-    if (deletedImportant) this.scheduleFlush('important')
-
-    return deletedContext || deletedArchive || deletedImportant
+  clearConversationData(contextId) {
+    const a = this.contextMap.delete(contextId)
+    const b = this.archives.delete(contextId)
+    const c = this.importantInfo.delete(`${contextId}_info`)
+    if (a) this.scheduleFlush('context')
+    if (b) this.scheduleFlush('archive')
+    if (c) this.scheduleFlush('important')
+    return a || b || c
   }
-
   clearAllContexts() {
     this.contextMap.clear()
     this.archives.clear()
     this.importantInfo.clear()
-    this.scheduleFlush('context')
-    this.scheduleFlush('archive')
-    this.scheduleFlush('important')
+    this.groupWindows.clear()
+    for (const key of ['context', 'archive', 'important']) this.scheduleFlush(key)
   }
-
-  getArchives() {
-    return this.archives
-  }
-
+  getArchives() { return this.archives }
   appendArchive(contextId, archive) {
-    if (!this.archives.has(contextId)) this.archives.set(contextId, [])
-    const list = this.archives.get(contextId)
+    const list = this.archives.get(contextId) || []
     list.push(archive)
     clampArray(list, LIMITS.archiveKeepCount)
+    this.archives.set(contextId, list)
     this.scheduleFlush('archive')
   }
-
-  getImportantInfo() {
-    return this.importantInfo
-  }
-
-  mergeImportantFacts(userId, payload) {
-    const key = `user_${userId}_info`
-    const current = this.importantInfo.get(key) || {
-      userId: String(userId),
-      profile: {},
-      facts: [],
-      updatedAt: 0
-    }
-
-    if (payload?.profile && typeof payload.profile === 'object') {
+  getImportantInfo() { return this.importantInfo }
+  mergeImportantFacts(contextId, payload) {
+    const key = `${contextId}_info`
+    const current = this.importantInfo.get(key) || { profile: {}, facts: [], updatedAt: 0 }
+    if (payload?.profile && typeof payload.profile === 'object' && !Array.isArray(payload.profile)) {
       current.profile = { ...current.profile, ...payload.profile }
     }
-
     if (Array.isArray(payload?.facts)) {
-      current.facts.push(...payload.facts.filter(Boolean).map(item => ({ content: String(item), time: Date.now() })))
+      const known = new Set(current.facts.map(item => item.content))
+      for (const item of payload.facts) {
+        if (typeof item !== 'string') continue
+        const content = item.trim().slice(0, 500)
+        if (!content || known.has(content)) continue
+        current.facts.push({ content, time: Date.now() })
+        known.add(content)
+      }
       clampArray(current.facts, LIMITS.summaryFactsKeep)
     }
-
     current.updatedAt = Date.now()
     this.importantInfo.set(key, current)
     this.scheduleFlush('important')
   }
-
-  getStats() {
-    return this.stats
-  }
-
+  getStats() { return this.stats }
   recordUsage(usage = {}) {
+    const prompt = nonnegative(usage?.prompt_tokens)
+    const completion = nonnegative(usage?.completion_tokens)
     this.stats.totalCalls++
-    this.stats.totalTokens += usage.total_tokens || 0
-    this.stats.promptTokens += usage.prompt_tokens || 0
-    this.stats.completionTokens += usage.completion_tokens || 0
+    this.stats.promptTokens += prompt
+    this.stats.completionTokens += completion
+    this.stats.totalTokens += Math.max(nonnegative(usage?.total_tokens), prompt + completion)
     this.scheduleFlush('stats')
   }
 
-  getBlacklist() {
-    return this.blacklist
+  getDailyBudget(now = Date.now()) {
+    const day = budgetDay(now)
+    if (this.meta.tokenBudget?.day !== day) this.meta.tokenBudget = { day, used: {} }
+    return this.meta.tokenBudget
   }
 
-  setBlacklist(blacklist) {
-    this.blacklist = blacklist
-    this.scheduleFlush('blacklist')
+  async reserveTokenBudget(subject, amount, limits = LIMITS, now = Date.now()) {
+    if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('无效 Token 预算')
+    const ledger = this.getDailyBudget(now)
+    const scopes = [['global', limits.dailyGlobalTokens], [`user:${subject.userId}`, limits.dailyUserTokens]]
+    if (subject.groupId != null) scopes.push([`group:${subject.groupId}`, limits.dailyGroupTokens])
+    if (scopes.some(([key, max]) => nonnegative(ledger.used[key]) + amount > max)) {
+      throw new RequestLimitError('DAILY_BUDGET', '今天聊得有点多了 明天再来吧')
+    }
+    for (const [key] of scopes) ledger.used[key] = nonnegative(ledger.used[key]) + amount
+    // 请求发出前持久化预占；重启和未知结果的失败请求无法清零额度
+    await this.enqueueWrite('meta')
+    return { ledger, keys: scopes.map(([key]) => key), amount }
   }
 
-  getRelationships() {
-    return this.relationships
+  async settleTokenBudget(reservation, usage) {
+    if (!usage || this.meta.tokenBudget !== reservation.ledger) return
+    const actual = nonnegative(usage.total_tokens)
+    for (const key of reservation.keys) {
+      reservation.ledger.used[key] = Math.max(0, nonnegative(reservation.ledger.used[key]) - reservation.amount + actual)
+    }
+    await this.enqueueWrite('meta')
   }
 
-  setRelationships(relationships) {
-    this.relationships = relationships
-    this.scheduleFlush('relationships')
-  }
-
+  getBlacklist() { return this.blacklist }
+  setBlacklist(blacklist) { this.blacklist = blacklist; this.scheduleFlush('blacklist') }
+  getRelationships() { return this.relationships }
+  setRelationships(relationships) { this.relationships = relationships; this.scheduleFlush('relationships') }
   pushGroupWindow(groupId, entry) {
     const key = String(groupId)
-    if (!this.groupWindows.has(key)) this.groupWindows.set(key, [])
-    const list = this.groupWindows.get(key)
-    list.push(entry)
+    const list = this.groupWindows.get(key) || []
+    list.push(String(entry).slice(0, LIMITS.maxMessageChars + 100))
     clampArray(list, LIMITS.recentGroupWindow)
+    this.groupWindows.set(key, list)
     return list
   }
-
-  getGroupWindow(groupId) {
-    return this.groupWindows.get(String(groupId)) || []
-  }
-
-  canPassRateLimit(userId) {
-    const key = String(userId)
-    const count = this.rateLimitCounter.get(key) || 0
-    if (count >= LIMITS.rateLimitPerMinute) return false
-    this.rateLimitCounter.set(key, count + 1)
-    return true
-  }
-
+  getGroupWindow(groupId) { return this.groupWindows.get(String(groupId)) || [] }
   async exportText(filename, content) {
-    const filePath = path.join(EXPORT_DIR, filename)
-    await fs.promises.writeFile(filePath, content, 'utf-8')
+    if (path.basename(filename) !== filename) throw new Error('无效导出文件名')
+    const filePath = path.join(this.exportDir, filename)
+    await fs.promises.writeFile(filePath, content, 'utf8')
     return filePath
   }
-
   async maybeBackup() {
-    const dateLabel = new Date().toISOString().slice(0, 10)
+    const dateLabel = budgetDay(Date.now())
     if (this.meta.lastBackupDate === dateLabel) return false
-
-    const files = [
-      ['context', 'context.json'],
-      ['important', 'important.json'],
-      ['stats', 'stats.json'],
-      ['archive', 'archive.json'],
-      ['blacklist', 'blacklist.json'],
-      ['relationships', 'relationships.json'],
-      ['meta', 'meta.json']
-    ]
-
     await this.flushAll()
-
-    await Promise.all(files.map(async ([, name]) => {
-      const src = path.join(DATA_DIR, name)
-      const dest = path.join(BACKUP_DIR, `${dateLabel}_${name}`)
-      if (fs.existsSync(src)) {
-        await fs.promises.copyFile(src, dest)
-      }
+    await Promise.all(Object.values(this.filePaths).map(async src => {
+      if (fs.existsSync(src)) await fs.promises.copyFile(src, path.join(this.backupDir, `${dateLabel}_${path.basename(src)}`))
     }))
-
-    const entries = await fs.promises.readdir(BACKUP_DIR)
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
-    await Promise.all(entries.map(async file => {
-      const fullPath = path.join(BACKUP_DIR, file)
-      const stat = await fs.promises.stat(fullPath)
-      if (stat.mtimeMs < sevenDaysAgo) await fs.promises.unlink(fullPath)
-    }))
-
+    for (const file of await fs.promises.readdir(this.backupDir)) {
+      const fullPath = path.join(this.backupDir, file)
+      if ((await fs.promises.stat(fullPath)).mtimeMs < sevenDaysAgo) await fs.promises.unlink(fullPath)
+    }
     this.meta.lastBackupDate = dateLabel
     this.scheduleFlush('meta')
     return true
